@@ -9,7 +9,7 @@
       Optional window underglow and music-reactive effects respond to bass, treble, and beats from system audio.<br>
     </td>
     <td>
-      <img src="https://github.com/visnudeva/CyberGlow/blob/main/docs/screenshots/desktop.png?raw=true" width="300">
+      <img src="https://github.com/visnudeva/CyberGlow/blob/aaded51dbfec01c2fe37c53b8234201b10040726/Screenshot.png?raw=true" width="300">
     </td>
   </tr>
 </table>
