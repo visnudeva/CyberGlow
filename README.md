@@ -1,4 +1,4 @@
-# <img src="https://github.com/visnudeva/CyberGlow/blob/main/docs/assets/logo.png?raw=true" width="50"> CyberGlow
+# <img src="https://github.com/visnudeva/CyberGlow/blob/e646b38943ac9e95ecfb19eaa403e06ed99e7655/CyberGlow.png?raw=true" width="100"> CyberGlow
 
 
 <table>
