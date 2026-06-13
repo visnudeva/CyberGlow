@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.cyberglow"
+          path="/org/gnome/shell/extensions/cyberglow/">
+    <key name="neon-shape" type="i">
+      <default>0</default>
+      <summary>Neon shape</summary>
+      <description>0: up-triangle, 1: down-triangle, 2: circle</description>
+    </key>
+    <key name="neon-color" type="s">
+      <default>'#00ffcc'</default>
+      <summary>Neon color</summary>
+      <description>Neon tube, dust, and rain color (e.g. #00ffcc)</description>
+    </key>
+    <key name="underglow" type="b">
+      <default>false</default>
+      <summary>Underglow</summary>
+      <description>Neon glow around normal windows, plus GTK decoration shadows (restart apps for the latter)</description>
+    </key>
+    <key name="music-reactive" type="b">
+      <default>false</default>
+      <summary>Music reactive</summary>
+      <description>React to system audio with multi-band neon effects</description>
+    </key>
+    <key name="reverse-rain" type="b">
+      <default>false</default>
+      <summary>Reverse rain</summary>
+      <description>Make the neon rain fall upward instead of downward</description>
+    </key>
+  </schema>
+</schemalist>
