@@ -6,9 +6,7 @@
   "shell-version": ["48", "49", "50"],
   "url": "https://github.com/visnudeva/CyberGlow",
   "settings-schema": "org.gnome.shell.extensions.cyberglow",
-  "preferences": "prefs.js",
   "donations": {
     "kofi": "visnu_deva"
   }
 }
-
