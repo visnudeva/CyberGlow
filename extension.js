@@ -790,6 +790,7 @@ export default class CyberGlowExtension extends Extension {
         this._enableRetrySource = null;
         this._enableRetries = 0;
         this._deferredStartupId = null;
+        this._settings = null;
     }
 
     enable() {
@@ -827,16 +828,17 @@ export default class CyberGlowExtension extends Extension {
         const monitor = Main.layoutManager.primaryMonitor;
         this._width = monitor.width;
         this._height = monitor.height;
+        this._settings = this.getSettings();
 
         this._onRepaintHandler = this._onRepaint.bind(this);
         this._canvas = new St.DrawingArea({
             width: this._width,
             height: this._height,
         });
-        this.connectObject(
-            this._canvas,
+        this._canvas.connectObject(
             'repaint',
             this._onRepaintHandler,
+            this,
         );
 
         this._canvas.set_position(monitor.x, monitor.y);
@@ -845,8 +847,7 @@ export default class CyberGlowExtension extends Extension {
         this._initEffect();
         this._setPerfTier('normal');
 
-        this.connectObject(
-            this.getSettings(),
+        this._settings.connectObject(
             'changed',
             (_settings, key) => {
                 if (key === 'music-reactive') {
@@ -862,15 +863,16 @@ export default class CyberGlowExtension extends Extension {
 
                 this._initEffect();
             },
+            this,
         );
 
         this._lastFrameTime = GLib.get_monotonic_time();
         this._rescheduleFrameTimer(this._desiredFrameInterval(false));
 
-        this.connectObject(
-            Main.layoutManager,
+        Main.layoutManager.connectObject(
             'monitors-changed',
             this._onMonitorsChanged.bind(this),
+            this,
         );
 
         this._scheduleHeavyStartup();
@@ -900,14 +902,14 @@ export default class CyberGlowExtension extends Extension {
         this._powerProfilesProxy = createPowerProfilesProxy();
         if (this._powerProfilesProxy) {
             this._setPerfTier(readPowerSaverActive(this._powerProfilesProxy) ? 'powerSaver' : 'normal');
-            this.connectObject(
-                this._powerProfilesProxy,
+            this._powerProfilesProxy.connectObject(
                 'g-properties-changed',
                 (_proxy, changed) => {
                     if (!('ActiveProfile' in changed))
                         return;
                     this._setPerfTier(readPowerSaverActive(this._powerProfilesProxy) ? 'powerSaver' : 'normal');
                 },
+                this,
             );
         }
 
@@ -916,14 +918,14 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _syncUnderglow() {
-        const enabled = this.getSettings().get_boolean('underglow');
+        const enabled = this._settings.get_boolean('underglow');
 
         if (enabled) {
             if (this._underglow)
                 return;
 
             try {
-                this._underglow = new UnderglowManager(this.getSettings());
+                this._underglow = new UnderglowManager(this._settings);
                 this._underglow.enable();
             } catch (err) {
                 console.error('[CyberGlow] failed to enable underglow:', err);
@@ -950,11 +952,11 @@ export default class CyberGlowExtension extends Extension {
             this._deferredStartupId = null;
         }
 
-        this.disconnectObject(Main.layoutManager);
-        this.disconnectObject(this.getSettings());
+        Main.layoutManager.disconnectObject(this);
+        this._settings?.disconnectObject(this);
 
         if (this._powerProfilesProxy) {
-            this.disconnectObject(this._powerProfilesProxy);
+            this._powerProfilesProxy.disconnectObject(this);
             this._powerProfilesProxy = null;
         }
 
@@ -964,7 +966,7 @@ export default class CyberGlowExtension extends Extension {
         }
 
         if (this._canvas) {
-            this.disconnectObject(this._canvas);
+            this._canvas.disconnectObject(this);
             this._onRepaintHandler = null;
             this._canvas.destroy();
             this._canvas = null;
@@ -981,17 +983,17 @@ export default class CyberGlowExtension extends Extension {
         }
 
         this._lastFrameTime = 0;
+        this._settings = null;
     }
 
     _initEffect() {
-        const settings = this.getSettings();
-        NeonShapeEffect.init(this._width, this._height, settings);
+        NeonShapeEffect.init(this._width, this._height, this._settings);
         NeonShapeEffect.setPerfTier(this._perfTier);
-        NeonShapeEffect.setMusicReactive(settings.get_boolean('music-reactive'));
+        NeonShapeEffect.setMusicReactive(this._settings.get_boolean('music-reactive'));
     }
 
     _syncAudioVisualizer() {
-        const enabled = this.getSettings().get_boolean('music-reactive');
+        const enabled = this._settings.get_boolean('music-reactive');
         NeonShapeEffect.setMusicReactive(enabled);
         this._underglow?.setAudioIntensity?.(1.0, 0);
 
@@ -1018,7 +1020,7 @@ export default class CyberGlowExtension extends Extension {
         const cfg = PERF_TIERS[this._perfTier] ?? PERF_TIERS.normal;
         let interval = inFlicker ? cfg.frameMsFlicker : cfg.frameMsCalm;
 
-        if (!this.getSettings().get_boolean('music-reactive'))
+        if (!this._settings.get_boolean('music-reactive'))
             return interval;
 
         if (inFlicker)
@@ -1070,7 +1072,7 @@ export default class CyberGlowExtension extends Extension {
             this._canvas.set_size(this._width, this._height);
         }
 
-        NeonShapeEffect.init(this._width, this._height, this.getSettings());
+        NeonShapeEffect.init(this._width, this._height, this._settings);
     }
 
     _onFrame() {
@@ -1079,7 +1081,8 @@ export default class CyberGlowExtension extends Extension {
         this._lastFrameTime = now;
 
         const wasFlickering = NeonShapeEffect.shape?.inFlickerEpisode ?? false;
-        if (this._audioVisualizer && this.getSettings().get_boolean('music-reactive')) {
+        const musicReactive = this._settings.get_boolean('music-reactive');
+        if (this._audioVisualizer && musicReactive) {
             NeonShapeEffect.setAudioLevels({
                 bass: this._audioVisualizer.bassLevel,
                 mid: this._audioVisualizer.midLevel,
@@ -1089,7 +1092,7 @@ export default class CyberGlowExtension extends Extension {
 
         }
         NeonShapeEffect.update(dt);
-        if (this._audioVisualizer && this.getSettings().get_boolean('music-reactive')) {
+        if (this._audioVisualizer && musicReactive) {
             const visualBeat = NeonShapeEffect._visualBeatPulse;
             this._underglow?.setAudioIntensity?.(
                 1.0 + this._audioVisualizer.bassLevel * 0.5 + visualBeat * 0.22,
