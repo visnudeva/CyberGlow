@@ -93,7 +93,7 @@ const {
     mixBandDb, dbToRawLevel, smoothLevel, updateNoiseFloor, effectiveThreshold,
     createBeatDetectorState, resetBeatDetector, updateBeatDetector,
     hasAudibleActivity, isSteadyAmbientEnergy, combinedBeatEnergy,
-    createVisualBeatState, updateVisualBeatPulse, compressAudioEnvelope,
+    createVisualBeatState, updateVisualBeatPulse,
     denseMixAttenuation, updateBandKick, BAND_RANGES, SPECTRUM_BANDS,
 } = await importLib('lib/audio-levels.js');
 
@@ -169,13 +169,10 @@ test('combinedBeatEnergy gates bass', () => {
     assert.ok(combinedBeatEnergy(1, 0, 0) > 0.9);
 });
 
-test('visual beat pulse and envelope helpers', () => {
+test('visual beat pulse and dense mix helpers', () => {
     const state = createVisualBeatState();
     updateVisualBeatPulse(state, 1, 0.016);
     assert.ok(state.pulse > 0.5);
-
-    assert.equal(compressAudioEnvelope(0.3), 0.3);
-    assert.ok(compressAudioEnvelope(0.9) < 0.9);
 
     assert.equal(denseMixAttenuation(0.1, 0.1, 0.1), 1.0);
     assert.ok(denseMixAttenuation(0.9, 0.9, 0.9) < 1.0);
@@ -298,6 +295,8 @@ const audioPactl = readFileSync(join(root, 'lib/audio-pactl.js'), 'utf8');
 const audioViz = readFileSync(join(root, 'lib/audio-visualizer.js'), 'utf8');
 const underglow = readFileSync(join(root, 'lib/underglow.js'), 'utf8');
 const indicator = readFileSync(join(root, 'lib/indicator.js'), 'utf8');
+const idleInhibit = readFileSync(join(root, 'lib/idle-inhibit.js'), 'utf8');
+const coreSources = [extensionJs, prefsJs, audioPactl, audioViz, underglow, indicator, idleInhibit];
 
 test('metadata has no preferences key', () => {
     assert.equal('preferences' in metadata, false);
@@ -318,21 +317,23 @@ test('audio-visualizer checks Gst.is_initialized before init', () => {
 });
 
 test('no this._enabled flag pattern in core modules', () => {
-    assert.equal(/this\._enabled\b/.test(extensionJs), false);
-    assert.equal(/this\._enabled\b/.test(underglow), false);
-    assert.equal(/this\._enabled\b/.test(audioViz), false);
+    for (const src of [extensionJs, underglow, audioViz, idleInhibit, indicator])
+        assert.equal(/this\._enabled\b/.test(src), false);
 });
 
-test('extension uses INSTANCE.connectObject / disconnectObject', () => {
-    assert.ok(extensionJs.includes('.connectObject('));
-    assert.ok(extensionJs.includes('.disconnectObject(this)'));
-    assert.equal(/this\.connectObject\(/.test(extensionJs), false);
-    assert.equal(/this\.disconnectObject\(\)/.test(extensionJs), false);
+test('extension/underglow/audio use INSTANCE.connectObject / disconnectObject', () => {
+    for (const src of [extensionJs, underglow, audioViz, indicator]) {
+        assert.ok(src.includes('.connectObject('));
+        assert.ok(src.includes('.disconnectObject(this)') || src.includes('.disconnectObject(item)'));
+        assert.equal(/this\.connectObject\(/.test(src), false);
+        assert.equal(/this\.disconnectObject\(\)/.test(src), false);
+    }
 });
 
 test('prefs.js does not use connectObject; cleans up on close-request', () => {
     assert.equal(prefsJs.includes('connectObject'), false);
     assert.ok(prefsJs.includes("window.connect('close-request'"));
+    assert.ok(prefsJs.includes('obj.disconnect(id)'));
 });
 
 test('frame timeout cleared before reschedule and on disable', () => {
@@ -347,11 +348,12 @@ test('frame timeout cleared before reschedule and on disable', () => {
     );
 });
 
-test('single shared settings instance passed to indicator', () => {
+test('single shared settings instance (one getSettings in extension)', () => {
+    const calls = extensionJs.match(/this\.getSettings\(\)/g) ?? [];
+    assert.equal(calls.length, 1);
     assert.ok(extensionJs.includes('new CyberGlowIndicator(this, this._settings)'));
     assert.ok(indicator.includes('_init(extension, settings)'));
-    assert.equal(indicator.includes('extension.getSettings()'), false);
-    assert.ok(extensionJs.includes('if (!this._settings)'));
+    assert.equal(indicator.includes('getSettings('), false);
 });
 
 test('underglow disable fully cleans up (no selective disable)', () => {
@@ -360,6 +362,16 @@ test('underglow disable fully cleans up (no selective disable)', () => {
         /disable\(\)\s*\{[\s\S]*?_disconnectGlobalSignals[\s\S]*?_removeUnderglow/
     );
     assert.equal(/if\s*\(\s*!this\._enabled\s*\)/.test(underglow), false);
+});
+
+test('no debug console.log in shipped modules', () => {
+    for (const src of coreSources)
+        assert.equal(/console\.(log|debug|info)\(/.test(src), false);
+});
+
+test('idle inhibit uses SessionManager D-Bus, not spawn', () => {
+    assert.ok(idleInhibit.includes('org.gnome.SessionManager'));
+    assert.equal(/GLib\.spawn|spawn_command|spawn_async/.test(idleInhibit), false);
 });
 
 test('all JS modules parse with node --check', () => {
