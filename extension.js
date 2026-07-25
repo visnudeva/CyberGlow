@@ -8,6 +8,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {UnderglowManager} from './lib/underglow.js';
 import {AudioVisualizer} from './lib/audio-visualizer.js';
+import {IdleInhibitor} from './lib/idle-inhibit.js';
+import {CyberGlowIndicator} from './lib/indicator.js';
 import {
     compressAudioEnvelope,
     createVisualBeatState,
@@ -15,6 +17,7 @@ import {
     updateBandKick,
     updateVisualBeatPulse,
 } from './lib/audio-levels.js';
+import {ALLOWED_WINDOW_TYPES} from './lib/underglow-style.js';
 import {
     clamp,
     expRand,
@@ -78,6 +81,15 @@ const NEON_AUDIO_BEAT_GLITCH_THRESHOLD = 0.52;
 const NEON_AUDIO_BASS_GATE = 0.06;
 const NEON_AUDIO_HUM_BLEND = 0.1;
 const HEAVY_STARTUP_DELAY_MS = 2000;
+// Live wallpapers (e.g. Laniakea) map windows well after login; keep restacking
+// neon above those actors in window_group past that window.
+const RAISE_CANVAS_DELAYS_MS = [500, 1100, 2000, 3000, 5000, 8000, 12000, 20000, 30000];
+const RAISE_WATCH_INTERVAL_MS = 500;
+const RAISE_WATCH_MAX_COUNT = 90; // 45s
+// Laniakea's real renderer lives in window_group (above _backgroundGroup), so
+// neon must share that layer and stack above the renderer actor.
+const LANIAKEA_RENDERER_ID = 'io.github.visnudeva.LaniakeaRenderer';
+const LANIAKEA_RENDERER_CMDLINE = 'laniakea-renderer';
 
 const NeonShapeEffect = {
     shape: null,
@@ -261,8 +273,7 @@ const NeonShapeEffect = {
     },
     _getNeonType() {
         if (!this._settings) return 0;
-        const shape = this._settings.get_int('neon-shape');
-        return clamp(shape === 3 ? 2 : shape, 0, 2);
+        return clamp(this._settings.get_int('neon-shape'), 0, 7);
     },
     _buildGlowPasses(gsz, glowAlpha) {
         const passes = getGlowWidthPasses(gsz, this._glowPassCount);
@@ -359,6 +370,25 @@ const NeonShapeEffect = {
         }
         ctx.closePath();
     },
+    _traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius) {
+        const r = Math.min(cornerRadius, halfW, halfH);
+        const left = cx - halfW;
+        const right = cx + halfW;
+        const top = cy - halfH;
+        const bottom = cy + halfH;
+
+        ctx.newPath();
+        ctx.moveTo(left + r, top);
+        ctx.lineTo(right - r, top);
+        ctx.arc(right - r, top + r, r, -Math.PI / 2, 0);
+        ctx.lineTo(right, bottom - r);
+        ctx.arc(right - r, bottom - r, r, 0, Math.PI / 2);
+        ctx.lineTo(left + r, bottom);
+        ctx.arc(left + r, bottom - r, r, Math.PI / 2, Math.PI);
+        ctx.lineTo(left, top + r);
+        ctx.arc(left + r, top + r, r, Math.PI, Math.PI * 1.5);
+        ctx.closePath();
+    },
     _shapeCornerRadius(size) {
         return size * 0.055;
     },
@@ -383,8 +413,32 @@ const NeonShapeEffect = {
         const baseCorner = this._shapeCornerRadius(s.size);
         const cornerRadius = this._cornerRadiusForOffset(baseCorner, offset);
 
+        if (type === 4 || type === 5 || type === 6) {
+            const wide = radius * (Math.sqrt(3) / 2);
+            let halfW;
+            let halfH;
+            if (type === 4) {
+                halfW = radius;
+                halfH = radius * 0.5;
+            } else if (type === 5) {
+                halfW = wide;
+                halfH = wide;
+            } else {
+                halfW = radius * 0.5;
+                halfH = radius;
+            }
+            this._traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius);
+            return;
+        }
+
+        if (type === 7) {
+            this._traceRoundedPolygonPath(ctx, cx, cy, radius, 4, -Math.PI / 2, cornerRadius);
+            return;
+        }
+
+        const sides = type === 3 ? 6 : 3;
         const rot = type === 1 ? Math.PI / 2 : -Math.PI / 2;
-        this._traceRoundedPolygonPath(ctx, cx, cy, radius, 3, rot, cornerRadius);
+        this._traceRoundedPolygonPath(ctx, cx, cy, radius, sides, rot, cornerRadius);
     },
     _getNeonColor() {
         if (!this._settings)
@@ -587,8 +641,11 @@ const NeonShapeEffect = {
             this._triggerBeatGlitch();
     },
     update(dt) {
-        const w = Main.layoutManager.primaryMonitor.width;
-        const h = Main.layoutManager.primaryMonitor.height;
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return;
+        const w = monitor.width;
+        const h = monitor.height;
         this._updateDust(dt, w, h);
         this._updateRain(dt, w, h);
         const humIntensity = this._updateIntensityHum(dt);
@@ -623,7 +680,7 @@ const NeonShapeEffect = {
 
         s.flickerLevel = 1.0;
         s.nextFlickerIn -= dt;
-        if (s.nextFlickerIn <= 0 && !this._musicReactive) {
+        if (s.nextFlickerIn <= 0) {
             s.inFlickerEpisode = true;
             s.episodeT = 0;
             s.flickerPhase = 0;
@@ -790,51 +847,89 @@ export default class CyberGlowExtension extends Extension {
         this._enableRetrySource = null;
         this._enableRetries = 0;
         this._deferredStartupId = null;
+        this._raiseCanvasTimeoutIds = [];
+        this._raiseCanvasDebounceId = 0;
+        this._raiseCanvasDelaysScheduled = false;
+        this._raiseCanvasWatchId = 0;
+        this._raiseCanvasWatchCount = 0;
+        this._laniakeaPidCache = new Map(); // pid → boolean
+        this._laniakeaPidPending = new Set();
         this._settings = null;
+        this._windowGroup = null;
+        this._idleInhibitor = null;
+        this._indicator = null;
     }
 
     enable() {
-        if (this._canvas)
+        if (this._canvas || this._enableRetrySource || this._settings)
             return;
 
+        this._settings = this.getSettings();
+        this._indicator = new CyberGlowIndicator(this, this._settings);
+        this._idleInhibitor = new IdleInhibitor();
+
         this._enableRetries = 0;
-        if (this._enableRetrySource)
-            GLib.source_remove(this._enableRetrySource);
-        this._enableRetrySource = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            return this._enableWhenReady();
-        });
+
+        // Wait until gnome-shell finishes startup before attaching into
+        // window_group. Restacking during early Wayland map/configure races
+        // have crashed mutter (xdg_toplevel_configure SIGSEGV) at login.
+        const startWhenReady = () => {
+            this._enableRetrySource = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                return this._enableWhenReady();
+            });
+        };
+
+        if (Main.layoutManager._startingUp) {
+            Main.layoutManager.connectObject(
+                'startup-complete',
+                () => {
+                    Main.layoutManager.disconnectObject(this);
+                    startWhenReady();
+                },
+                this,
+            );
+        } else {
+            startWhenReady();
+        }
     }
 
     _enableWhenReady() {
-        const backgroundGroup = Main.layoutManager?._backgroundGroup;
-        if (!backgroundGroup) {
+        const windowGroup = global.window_group ?? global.windowGroup;
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!windowGroup || !monitor) {
             this._enableRetries += 1;
             if (this._enableRetries > 120)
-                console.error('[CyberGlow] layout background group never became ready');
+                console.error('[CyberGlow] window group/monitor never became ready');
             return this._enableRetries <= 120 ? GLib.SOURCE_CONTINUE : GLib.SOURCE_REMOVE;
         }
 
         this._enableRetrySource = null;
-        try {
-            this._enableInternal(backgroundGroup);
-        } catch (err) {
-            console.error('[CyberGlow] failed to enable extension:', err);
-            this.disable();
-        }
+        this._enableInternal(windowGroup);
         return GLib.SOURCE_REMOVE;
     }
 
-    _enableInternal(backgroundGroup) {
+    _enableInternal(windowGroup) {
+        this._windowGroup = windowGroup;
         const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            throw new Error('primary monitor unavailable');
+
         this._width = monitor.width;
         this._height = monitor.height;
-        this._settings = this.getSettings();
+        if (!this._settings)
+            this._settings = this.getSettings();
 
         this._onRepaintHandler = this._onRepaint.bind(this);
         this._canvas = new St.DrawingArea({
             width: this._width,
             height: this._height,
+            reactive: false,
+            can_focus: false,
         });
+        // Transparent outside neon strokes so the live-wallpaper clone (still in
+        // `_backgroundGroup`) shows through; we live in window_group so we can
+        // stack above Laniakea's real renderer window.
+        this._canvas.set_style('background-color: transparent;');
         this._canvas.connectObject(
             'repaint',
             this._onRepaintHandler,
@@ -842,17 +937,36 @@ export default class CyberGlowExtension extends Extension {
         );
 
         this._canvas.set_position(monitor.x, monitor.y);
-        backgroundGroup.add_child(this._canvas);
+        windowGroup.insert_child_at_index(this._canvas, 0);
+        // Never restack synchronously from insert/child-added — defer.
+        this._raiseCanvasSoon();
 
+        this._windowGroup.connectObject(
+            'child-added',
+            (_group, child) => {
+                if (child === this._canvas)
+                    return;
+                this._raiseCanvasSoon();
+            },
+            this,
+        );
+
+        this._scheduleRaiseCanvasToTop();
         this._initEffect();
         this._setPerfTier('normal');
 
         this._settings.connectObject(
             'changed',
             (_settings, key) => {
+                if (key === 'neon-enabled') {
+                    this._syncNeonEnabled();
+                    return;
+                }
+
                 if (key === 'music-reactive') {
                     this._initEffect();
                     this._syncAudioVisualizer();
+                    this._syncIdleInhibit();
                     return;
                 }
 
@@ -861,20 +975,75 @@ export default class CyberGlowExtension extends Extension {
                     return;
                 }
 
+                if (key === 'keep-awake') {
+                    this._syncIdleInhibit();
+                    return;
+                }
+
                 this._initEffect();
             },
             this,
         );
 
-        this._lastFrameTime = GLib.get_monotonic_time();
-        this._rescheduleFrameTimer(this._desiredFrameInterval(false));
+        this._syncNeonEnabled();
 
         Main.layoutManager.connectObject(
             'monitors-changed',
-            this._onMonitorsChanged.bind(this),
+            () => {
+                this._onMonitorsChanged();
+                this._scheduleRaiseCanvasToTop();
+                this._startCanvasRaiseWatch();
+            },
             this,
         );
 
+        Main.overview.connectObject(
+            'showing',
+            () => {
+                if (this._canvas)
+                    this._canvas.visible = false;
+            },
+            this,
+        );
+        Main.overview.connectObject(
+            'hiding',
+            () => {
+                this._syncNeonEnabled();
+                this._scheduleRaiseCanvasToTop();
+            },
+            this,
+        );
+
+        if (Main.layoutManager._startingUp) {
+            Main.layoutManager.connectObject(
+                'startup-complete',
+                () => {
+                    this._scheduleRaiseCanvasToTop();
+                    this._startCanvasRaiseWatch();
+                },
+                this,
+            );
+        }
+
+        global.workspace_manager.connectObject(
+            'active-workspace-changed',
+            () => {
+                this._scheduleRaiseCanvasToTop();
+                this._startCanvasRaiseWatch();
+            },
+            this,
+        );
+
+        // Keep neon below normal windows when the stack changes (raises, maps, etc.).
+        global.display.connectObject(
+            'restacked',
+            () => this._raiseCanvasSoon(),
+            'window-entered-monitor',
+            () => this._raiseCanvasSoon(),
+            this,
+        );
+
+        this._startCanvasRaiseWatch();
         this._scheduleHeavyStartup();
     }
 
@@ -888,11 +1057,7 @@ export default class CyberGlowExtension extends Extension {
                 this._deferredStartupId = null;
                 if (!this._canvas)
                     return GLib.SOURCE_REMOVE;
-                try {
-                    this._startHeavySubsystems();
-                } catch (err) {
-                    console.error('[CyberGlow] deferred startup failed:', err);
-                }
+                this._startHeavySubsystems();
                 return GLib.SOURCE_REMOVE;
             }
         );
@@ -915,6 +1080,19 @@ export default class CyberGlowExtension extends Extension {
 
         this._syncAudioVisualizer();
         this._syncUnderglow();
+        this._syncIdleInhibit();
+    }
+
+    _syncIdleInhibit() {
+        if (!this._settings || !this._idleInhibitor)
+            return;
+
+        const want = this._settings.get_boolean('keep-awake')
+            && this._settings.get_boolean('neon-enabled')
+            && this._settings.get_boolean('music-reactive')
+            && this._audioVisualizer
+            && !this._audioVisualizer.isSilent;
+        this._idleInhibitor.setActive(want);
     }
 
     _syncUnderglow() {
@@ -924,13 +1102,8 @@ export default class CyberGlowExtension extends Extension {
             if (this._underglow)
                 return;
 
-            try {
-                this._underglow = new UnderglowManager(this._settings);
-                this._underglow.enable();
-            } catch (err) {
-                console.error('[CyberGlow] failed to enable underglow:', err);
-                this._underglow = null;
-            }
+            this._underglow = new UnderglowManager(this._settings);
+            this._underglow.enable();
             return;
         }
 
@@ -952,8 +1125,28 @@ export default class CyberGlowExtension extends Extension {
             this._deferredStartupId = null;
         }
 
+        for (const id of this._raiseCanvasTimeoutIds)
+            GLib.source_remove(id);
+        this._raiseCanvasTimeoutIds = [];
+        this._raiseCanvasDelaysScheduled = false;
+
+        if (this._raiseCanvasDebounceId) {
+            GLib.source_remove(this._raiseCanvasDebounceId);
+            this._raiseCanvasDebounceId = 0;
+        }
+
+        global.display.disconnectObject(this);
+
+        this._laniakeaPidCache.clear();
+        this._laniakeaPidPending.clear();
+        this._stopCanvasRaiseWatch();
+
         Main.layoutManager.disconnectObject(this);
+        Main.overview.disconnectObject(this);
+        global.workspace_manager.disconnectObject(this);
         this._settings?.disconnectObject(this);
+        this._windowGroup?.disconnectObject(this);
+        this._windowGroup = null;
 
         if (this._powerProfilesProxy) {
             this._powerProfilesProxy.disconnectObject(this);
@@ -982,8 +1175,434 @@ export default class CyberGlowExtension extends Extension {
             this._audioVisualizer = null;
         }
 
+        this._indicator?.destroy();
+        this._indicator = null;
+
+        this._idleInhibitor?.destroy();
+        this._idleInhibitor = null;
         this._lastFrameTime = 0;
         this._settings = null;
+    }
+
+    _syncNeonEnabled() {
+        if (!this._settings || !this._canvas)
+            return;
+
+        const settingOn = this._settings.get_boolean('neon-enabled');
+        this._canvas.visible = settingOn && !Main.overview?.visible;
+
+        if (settingOn) {
+            this._lastFrameTime = GLib.get_monotonic_time();
+            this._rescheduleFrameTimer(this._desiredFrameInterval(false));
+            if (this._canvas.visible)
+                this._canvas.queue_repaint();
+        } else if (this._timeoutId) {
+            GLib.source_remove(this._timeoutId);
+            this._timeoutId = null;
+        }
+
+        this._syncAudioVisualizer();
+        this._syncIdleInhibit();
+    }
+
+    _decodeProcCmdline(bytes) {
+        if (typeof bytes === 'string')
+            return bytes;
+
+        const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        let text = '';
+        for (let i = 0; i < arr.length; i++)
+            text += arr[i] === 0 ? ' ' : String.fromCharCode(arr[i]);
+        return text;
+    }
+
+    _probeLaniakeaPid(pid) {
+        if (this._laniakeaPidPending.has(pid))
+            return;
+
+        this._laniakeaPidPending.add(pid);
+        const file = Gio.File.new_for_path(`/proc/${pid}/cmdline`);
+        file.load_contents_async(null, (f, result) => {
+            this._laniakeaPidPending.delete(pid);
+
+            let matched = false;
+            try {
+                const [, bytes] = f.load_contents_finish(result);
+                const text = this._decodeProcCmdline(bytes);
+                matched = text.includes(LANIAKEA_RENDERER_CMDLINE)
+                    || text.includes(LANIAKEA_RENDERER_ID);
+            } catch {
+                matched = false;
+            }
+
+            const previous = this._laniakeaPidCache.get(pid);
+            this._laniakeaPidCache.set(pid, matched);
+            if (matched && previous !== matched)
+                this._raiseCanvasSoon();
+        });
+    }
+
+    _isLaniakeaRendererPid(pid) {
+        if (!pid || pid <= 0)
+            return false;
+
+        if (this._laniakeaPidCache.has(pid))
+            return this._laniakeaPidCache.get(pid);
+
+        // Async probe; treat as non-Laniakea until resolved, then restack.
+        this._laniakeaPidCache.set(pid, false);
+        this._probeLaniakeaPid(pid);
+        return false;
+    }
+
+    _isLaniakeaRendererWindow(window) {
+        if (!window)
+            return false;
+
+        const title = window.title ?? '';
+        if (title.includes(LANIAKEA_RENDERER_ID) || title.includes('Laniakea Renderer'))
+            return true;
+
+        try {
+            const gtkId = window.get_gtk_application_id?.();
+            if (gtkId === LANIAKEA_RENDERER_ID)
+                return true;
+        } catch {
+            // Meta API may be unavailable on some shells.
+        }
+
+        try {
+            const wmClass = window.get_wm_class?.() ?? '';
+            const wmInstance = window.get_wm_class_instance?.() ?? '';
+            if (wmClass.includes('LaniakeaRenderer') || wmInstance.includes('LaniakeaRenderer'))
+                return true;
+        } catch {
+            // Best-effort identity fallback.
+        }
+
+        try {
+            const pid = window.get_pid?.() ?? 0;
+            if (this._isLaniakeaRendererPid(pid))
+                return true;
+        } catch {
+            // Best-effort.
+        }
+
+        return false;
+    }
+
+    _windowFromActor(actor) {
+        if (!actor)
+            return null;
+        return actor.meta_window ?? actor.get_meta_window?.() ?? null;
+    }
+
+    // Solid app windows that must occlude neon. Menus, tooltips, and other
+    // ephemeral popups (tab previews, etc.) are excluded — using them as the
+    // stack ceiling lets restacks put neon above the real app window.
+    _isOccludingWindowActor(actor) {
+        if (!actor || actor === this._canvas)
+            return false;
+
+        const window = this._windowFromActor(actor);
+        if (!window || this._isLaniakeaRendererWindow(window))
+            return false;
+
+        try {
+            if (window.is_override_redirect?.())
+                return false;
+        } catch {
+            // Best-effort; fall through to window-type check.
+        }
+
+        try {
+            return ALLOWED_WINDOW_TYPES.has(window.get_window_type());
+        } catch {
+            // If type is unavailable, treat as occluder to avoid bleed-through.
+            return true;
+        }
+    }
+
+    // Any non-Laniakea surface that should punch a hole in neon painting.
+    // Includes menus/tooltips so glow cannot show through them when a restack
+    // briefly leaves the canvas above the parent app.
+    _isNeonMaskWindowActor(actor) {
+        if (!actor || actor === this._canvas)
+            return false;
+
+        try {
+            if (!actor.visible)
+                return false;
+        } catch {
+            return false;
+        }
+
+        const window = this._windowFromActor(actor);
+        if (!window || this._isLaniakeaRendererWindow(window))
+            return false;
+
+        try {
+            if (window.minimized)
+                return false;
+            if (window.showing_on_its_workspace && !window.showing_on_its_workspace())
+                return false;
+        } catch {
+            // Best-effort visibility checks.
+        }
+
+        return true;
+    }
+
+    _actorRectInCanvas(actor, window) {
+        const canvas = this._canvas;
+        if (!canvas)
+            return null;
+
+        try {
+            const frame = window?.get_frame_rect?.();
+            if (frame && frame.width > 0 && frame.height > 0) {
+                return {
+                    x: frame.x - canvas.x,
+                    y: frame.y - canvas.y,
+                    width: frame.width,
+                    height: frame.height,
+                };
+            }
+        } catch {
+            // Fall through to actor allocation.
+        }
+
+        try {
+            return {
+                x: actor.x - canvas.x,
+                y: actor.y - canvas.y,
+                width: actor.width,
+                height: actor.height,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    // Keep neon pixels clear over windows/menus so stacking glitches cannot
+    // paint glow on top of app content (transparent holes still composite).
+    _clipNeonAwayFromWindows(ctx, width, height) {
+        const group = this._windowGroup ?? global.window_group ?? global.windowGroup;
+        if (!group || !ctx)
+            return;
+
+        let children;
+        try {
+            children = group.get_children();
+        } catch {
+            return;
+        }
+
+        let punched = false;
+        try {
+            ctx.setFillRule(Cairo.FillRule.EVEN_ODD);
+        } catch {
+            // Older cairo bindings may lack FillRule; skip masking.
+            return;
+        }
+
+        ctx.rectangle(0, 0, width, height);
+
+        for (let i = 0; i < children.length; i++) {
+            const actor = children[i];
+            if (!this._isNeonMaskWindowActor(actor))
+                continue;
+
+            const window = this._windowFromActor(actor);
+            const rect = this._actorRectInCanvas(actor, window);
+            if (!rect || rect.width <= 0 || rect.height <= 0)
+                continue;
+            if (rect.x + rect.width <= 0 || rect.y + rect.height <= 0)
+                continue;
+            if (rect.x >= width || rect.y >= height)
+                continue;
+
+            ctx.rectangle(rect.x, rect.y, rect.width, rect.height);
+            punched = true;
+        }
+
+        if (punched)
+            ctx.clip();
+    }
+
+    _raiseCanvasToTop() {
+        const group = this._windowGroup ?? global.window_group ?? global.windowGroup;
+        const canvas = this._canvas;
+        if (!group || !canvas || canvas.is_finalized?.())
+            return;
+
+        // Skip while shell is still starting — window actors may not be
+        // configure-ready and sibling restacks can trip mutter bugs.
+        if (Main.layoutManager._startingUp)
+            return;
+
+        try {
+            // Reattach into window_group if a restack orphaned us.
+            if (!group.contains(canvas)) {
+                const parent = canvas.get_parent?.();
+                if (parent && parent !== group) {
+                    try {
+                        parent.remove_child(canvas);
+                    } catch {
+                        // Actor may already be detached during shell teardown.
+                    }
+                }
+                if (!group.contains(canvas))
+                    group.insert_child_at_index(canvas, 0);
+            }
+
+            let children;
+            try {
+                children = group.get_children();
+            } catch {
+                children = [];
+            }
+
+            // Stay above Laniakea renderers but below the first solid app window.
+            // Ignore menus/tooltips as ceiling — hover restacks made those leap
+            // neon over the parent app.
+            let ceiling = null;
+            let topLaniakea = null;
+
+            for (let i = 0; i < children.length; i++) {
+                const actor = children[i];
+                if (this._isOccludingWindowActor(actor)) {
+                    ceiling = actor;
+                    break;
+                }
+            }
+
+            for (let i = children.length - 1; i >= 0; i--) {
+                const actor = children[i];
+                if (actor === canvas)
+                    continue;
+
+                const window = this._windowFromActor(actor);
+                if (window && this._isLaniakeaRendererWindow(window)) {
+                    topLaniakea = actor;
+                    break;
+                }
+            }
+
+            if (ceiling)
+                group.set_child_below_sibling(canvas, ceiling);
+            else if (topLaniakea)
+                group.set_child_above_sibling(canvas, topLaniakea);
+            else
+                group.set_child_at_index(canvas, 0);
+
+            // If a Laniakea renderer sits below the ceiling but above us, climb
+            // above it without passing the solid-app ceiling.
+            try {
+                children = group.get_children();
+            } catch {
+                children = [];
+            }
+            let canvasIndex = children.indexOf(canvas);
+            const ceilingIndex = ceiling ? children.indexOf(ceiling) : -1;
+            if (canvasIndex >= 0) {
+                for (let i = children.length - 1; i >= 0; i--) {
+                    if (i <= canvasIndex)
+                        break;
+                    if (ceilingIndex >= 0 && i >= ceilingIndex)
+                        continue;
+
+                    const window = this._windowFromActor(children[i]);
+                    if (window && this._isLaniakeaRendererWindow(window)) {
+                        group.set_child_above_sibling(canvas, children[i]);
+                        break;
+                    }
+                }
+            }
+
+            // Safety clamp: never paint above any solid app (Laniakea or a popup
+            // restack can leave us above an occluder after the placement above).
+            try {
+                children = group.get_children();
+            } catch {
+                children = [];
+            }
+            canvasIndex = children.indexOf(canvas);
+            if (canvasIndex > 0) {
+                for (let i = 0; i < canvasIndex; i++) {
+                    if (this._isOccludingWindowActor(children[i])) {
+                        group.set_child_below_sibling(canvas, children[i]);
+                        break;
+                    }
+                }
+            }
+
+            if (this._settings?.get_boolean('neon-enabled') && !Main.overview?.visible)
+                canvas.visible = true;
+        } catch (err) {
+            console.error('[CyberGlow] failed to restack neon canvas:', err);
+        }
+    }
+
+    _raiseCanvasSoon() {
+        if (this._raiseCanvasDebounceId)
+            return;
+
+        // Idle (not a 32ms timer): menu/tab restacks must correct before paint.
+        this._raiseCanvasDebounceId = GLib.idle_add(GLib.PRIORITY_HIGH_IDLE, () => {
+            this._raiseCanvasDebounceId = 0;
+            this._raiseCanvasToTop();
+            this._canvas?.queue_repaint();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _scheduleRaiseCanvasDelays() {
+        if (this._raiseCanvasDelaysScheduled)
+            return;
+        this._raiseCanvasDelaysScheduled = true;
+
+        for (const delay of RAISE_CANVAS_DELAYS_MS) {
+            const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                const index = this._raiseCanvasTimeoutIds.indexOf(id);
+                if (index >= 0)
+                    this._raiseCanvasTimeoutIds.splice(index, 1);
+                this._raiseCanvasToTop();
+                this._canvas?.queue_repaint();
+                return GLib.SOURCE_REMOVE;
+            });
+            this._raiseCanvasTimeoutIds.push(id);
+        }
+    }
+
+    _scheduleRaiseCanvasToTop() {
+        this._raiseCanvasSoon();
+        this._scheduleRaiseCanvasDelays();
+    }
+
+    _stopCanvasRaiseWatch() {
+        if (this._raiseCanvasWatchId) {
+            GLib.source_remove(this._raiseCanvasWatchId);
+            this._raiseCanvasWatchId = 0;
+        }
+        this._raiseCanvasWatchCount = 0;
+    }
+
+    _startCanvasRaiseWatch() {
+        this._stopCanvasRaiseWatch();
+        this._raiseCanvasWatchId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            RAISE_WATCH_INTERVAL_MS,
+            () => {
+                this._raiseCanvasToTop();
+                this._raiseCanvasWatchCount += 1;
+                if (this._raiseCanvasWatchCount >= RAISE_WATCH_MAX_COUNT) {
+                    this._raiseCanvasWatchId = 0;
+                    return GLib.SOURCE_REMOVE;
+                }
+                return GLib.SOURCE_CONTINUE;
+            },
+        );
     }
 
     _initEffect() {
@@ -993,19 +1612,15 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _syncAudioVisualizer() {
-        const enabled = this._settings.get_boolean('music-reactive');
+        const enabled = this._settings.get_boolean('neon-enabled')
+            && this._settings.get_boolean('music-reactive');
         NeonShapeEffect.setMusicReactive(enabled);
         this._underglow?.setAudioIntensity?.(1.0, 0);
 
         if (enabled) {
             if (!this._audioVisualizer) {
-                try {
-                    this._audioVisualizer = new AudioVisualizer();
-                    this._audioVisualizer.enable();
-                } catch (err) {
-                    console.error('[CyberGlow] failed to enable audio visualizer:', err);
-                    this._audioVisualizer = null;
-                }
+                this._audioVisualizer = new AudioVisualizer();
+                this._audioVisualizer.enable();
             }
         } else if (this._audioVisualizer) {
             this._audioVisualizer.disable();
@@ -1019,6 +1634,9 @@ export default class CyberGlowExtension extends Extension {
     _desiredFrameInterval(inFlicker) {
         const cfg = PERF_TIERS[this._perfTier] ?? PERF_TIERS.normal;
         let interval = inFlicker ? cfg.frameMsFlicker : cfg.frameMsCalm;
+
+        if (!this._settings?.get_boolean('neon-enabled'))
+            return interval;
 
         if (!this._settings.get_boolean('music-reactive'))
             return interval;
@@ -1053,8 +1671,14 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _rescheduleFrameTimer(intervalMs) {
-        if (this._timeoutId)
+        if (this._timeoutId) {
             GLib.source_remove(this._timeoutId);
+            this._timeoutId = null;
+        }
+
+        if (!this._settings?.get_boolean('neon-enabled'))
+            return;
+
         this._frameIntervalMs = intervalMs;
         this._timeoutId = GLib.timeout_add(GLib.PRIORITY_LOW, intervalMs, () => {
             this._onFrame();
@@ -1064,6 +1688,9 @@ export default class CyberGlowExtension extends Extension {
 
     _onMonitorsChanged() {
         const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return;
+
         this._width = monitor.width;
         this._height = monitor.height;
 
@@ -1073,9 +1700,13 @@ export default class CyberGlowExtension extends Extension {
         }
 
         NeonShapeEffect.init(this._width, this._height, this._settings);
+        this._raiseCanvasDelaysScheduled = false;
     }
 
     _onFrame() {
+        if (!this._settings?.get_boolean('neon-enabled'))
+            return;
+
         const now = GLib.get_monotonic_time();
         const dt = Math.min((now - this._lastFrameTime) / 1000000, 0.1);
         this._lastFrameTime = now;
@@ -1103,6 +1734,7 @@ export default class CyberGlowExtension extends Extension {
         const desiredInterval = this._desiredFrameInterval(inFlicker);
         if (desiredInterval !== this._frameIntervalMs || wasFlickering !== inFlicker)
             this._rescheduleFrameTimer(desiredInterval);
+        this._syncIdleInhibit();
         this._canvas.queue_repaint();
     }
 
@@ -1115,7 +1747,12 @@ export default class CyberGlowExtension extends Extension {
         ctx.paint();
         ctx.setOperator(Cairo.Operator.OVER);
 
-        NeonShapeEffect.draw(ctx, width, height);
+        if (this._settings?.get_boolean('neon-enabled')) {
+            // Clear over window/menu rects so glow cannot bleed through even when
+            // a restack momentarily leaves the canvas above an app.
+            this._clipNeonAwayFromWindows(ctx, width, height);
+            NeonShapeEffect.draw(ctx, width, height);
+        }
 
         ctx.$dispose();
         return Clutter.EVENT_STOP;

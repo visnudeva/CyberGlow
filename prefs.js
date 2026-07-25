@@ -7,6 +7,11 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 export default class CyberGlowPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
+        const bindings = [];
+
+        const bind = (obj, signal, handler) => {
+            bindings.push([obj, obj.connect(signal, handler)]);
+        };
 
         const page = new Adw.PreferencesPage({
             title: 'CyberGlow',
@@ -24,26 +29,25 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
             title: 'Shape',
             subtitle: 'Pick one of the shapes (no morphing)',
             model: Gtk.StringList.new([
-                'up-triangle',
-                'down-triangle',
+                'Up triangle',
+                'Down triangle',
                 'Circle',
+                'Hexagon',
+                'Horizontal rectangle',
+                'Square',
+                'Vertical rectangle',
+                'Diamond',
             ]),
             selected: settings.get_int('neon-shape'),
         });
-        shapeRow.connectObject(
-            'notify::selected',
-            () => settings.set_int('neon-shape', shapeRow.get_selected()),
-            this,
-        );
-        settings.connectObject(
-            'changed::neon-shape',
-            () => {
-                const v = settings.get_int('neon-shape');
-                if (shapeRow.get_selected() !== v)
-                    shapeRow.set_selected(v);
-            },
-            this,
-        );
+        bind(shapeRow, 'notify::selected', () => {
+            settings.set_int('neon-shape', shapeRow.get_selected());
+        });
+        bind(settings, 'changed::neon-shape', () => {
+            const v = settings.get_int('neon-shape');
+            if (shapeRow.get_selected() !== v)
+                shapeRow.set_selected(v);
+        });
         neonGroup.add(shapeRow);
 
         const colorRow = new Adw.ActionRow({
@@ -62,29 +66,21 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
         });
         let syncingColor = false;
-        colorButton.connectObject(
-            'notify::rgba',
-            () => {
-                if (syncingColor)
-                    return;
-                settings.set_string('neon-color', colorButton.get_rgba().to_string());
-            },
-            this,
-        );
-        settings.connectObject(
-            'changed::neon-color',
-            () => {
-                const r = new Gdk.RGBA();
-                if (!r.parse(settings.get_string('neon-color')))
-                    return;
-                if (colorButton.get_rgba().equal(r))
-                    return;
-                syncingColor = true;
-                colorButton.set_rgba(r);
-                syncingColor = false;
-            },
-            this,
-        );
+        bind(colorButton, 'notify::rgba', () => {
+            if (syncingColor)
+                return;
+            settings.set_string('neon-color', colorButton.get_rgba().to_string());
+        });
+        bind(settings, 'changed::neon-color', () => {
+            const r = new Gdk.RGBA();
+            if (!r.parse(settings.get_string('neon-color')))
+                return;
+            if (colorButton.get_rgba().equal(r))
+                return;
+            syncingColor = true;
+            colorButton.set_rgba(r);
+            syncingColor = false;
+        });
         colorRow.add_suffix(colorButton);
         neonGroup.add(colorRow);
 
@@ -93,20 +89,14 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
             subtitle: 'Neon glow on window shadows (GTK apps; restart apps to apply)',
             active: settings.get_boolean('underglow'),
         });
-        underglowRow.connectObject(
-            'notify::active',
-            () => settings.set_boolean('underglow', underglowRow.get_active()),
-            this,
-        );
-        settings.connectObject(
-            'changed::underglow',
-            () => {
-                const active = settings.get_boolean('underglow');
-                if (underglowRow.get_active() !== active)
-                    underglowRow.set_active(active);
-            },
-            this,
-        );
+        bind(underglowRow, 'notify::active', () => {
+            settings.set_boolean('underglow', underglowRow.get_active());
+        });
+        bind(settings, 'changed::underglow', () => {
+            const active = settings.get_boolean('underglow');
+            if (underglowRow.get_active() !== active)
+                underglowRow.set_active(active);
+        });
         neonGroup.add(underglowRow);
 
         const musicReactiveRow = new Adw.SwitchRow({
@@ -114,50 +104,49 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
             subtitle: 'Multi-band neon effects driven by system audio (GStreamer)',
             active: settings.get_boolean('music-reactive'),
         });
-        musicReactiveRow.connectObject(
-            'notify::active',
-            () => settings.set_boolean('music-reactive', musicReactiveRow.get_active()),
-            this,
-        );
-        settings.connectObject(
-            'changed::music-reactive',
-            () => {
-                const active = settings.get_boolean('music-reactive');
-                if (musicReactiveRow.get_active() !== active)
-                    musicReactiveRow.set_active(active);
-            },
-            this,
-        );
+        bind(musicReactiveRow, 'notify::active', () => {
+            settings.set_boolean('music-reactive', musicReactiveRow.get_active());
+        });
+        bind(settings, 'changed::music-reactive', () => {
+            const active = settings.get_boolean('music-reactive');
+            if (musicReactiveRow.get_active() !== active)
+                musicReactiveRow.set_active(active);
+        });
         neonGroup.add(musicReactiveRow);
+
+        const keepAwakeRow = new Adw.SwitchRow({
+            title: 'Keep awake',
+            subtitle: 'Prevent screen blanking while music visualization is active',
+            active: settings.get_boolean('keep-awake'),
+        });
+        bind(keepAwakeRow, 'notify::active', () => {
+            settings.set_boolean('keep-awake', keepAwakeRow.get_active());
+        });
+        bind(settings, 'changed::keep-awake', () => {
+            const active = settings.get_boolean('keep-awake');
+            if (keepAwakeRow.get_active() !== active)
+                keepAwakeRow.set_active(active);
+        });
+        neonGroup.add(keepAwakeRow);
 
         const reverseRainRow = new Adw.SwitchRow({
             title: 'Reverse rain',
             subtitle: 'Make the neon rain fall upward',
             active: settings.get_boolean('reverse-rain'),
         });
-        reverseRainRow.connectObject(
-            'notify::active',
-            () => settings.set_boolean('reverse-rain', reverseRainRow.get_active()),
-            this,
-        );
-        settings.connectObject(
-            'changed::reverse-rain',
-            () => {
-                const active = settings.get_boolean('reverse-rain');
-                if (reverseRainRow.get_active() !== active)
-                    reverseRainRow.set_active(active);
-            },
-            this,
-        );
+        bind(reverseRainRow, 'notify::active', () => {
+            settings.set_boolean('reverse-rain', reverseRainRow.get_active());
+        });
+        bind(settings, 'changed::reverse-rain', () => {
+            const active = settings.get_boolean('reverse-rain');
+            if (reverseRainRow.get_active() !== active)
+                reverseRainRow.set_active(active);
+        });
         neonGroup.add(reverseRainRow);
 
-        window.connectObject('destroy', () => {
-            shapeRow.disconnectObject(this);
-            settings.disconnectObject(this);
-            colorButton.disconnectObject(this);
-            underglowRow.disconnectObject(this);
-            musicReactiveRow.disconnectObject(this);
-            reverseRainRow.disconnectObject(this);
-        }, this);
+        window.connect('close-request', () => {
+            for (const [obj, id] of bindings)
+                obj.disconnect(id);
+        });
     }
 }

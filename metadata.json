@@ -1,12 +1,16 @@
 {
-  "uuid": "CyberGlow@visnudeva.github.io",
-  "name": "CyberGlow",
   "description": "Neon shape overlay with tinted rain, dust, and glitch flicker on the desktop background, plus optional neon window underglow",
-  "version": 1,
-  "shell-version": ["48", "49", "50"],
-  "url": "https://github.com/visnudeva/CyberGlow",
-  "settings-schema": "org.gnome.shell.extensions.cyberglow",
   "donations": {
     "kofi": "visnu_deva"
-  }
+  },
+  "name": "CyberGlow",
+  "settings-schema": "org.gnome.shell.extensions.cyberglow",
+  "shell-version": [
+    "48",
+    "49",
+    "50"
+  ],
+  "url": "https://github.com/visnudeva/CyberGlow",
+  "uuid": "CyberGlow@visnudeva.github.io",
+  "version": 4
 }
