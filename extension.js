@@ -8,9 +8,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {UnderglowManager} from './lib/underglow.js';
 import {AudioVisualizer} from './lib/audio-visualizer.js';
-import {IdleInhibitor} from './lib/idle-inhibit.js';
-import {CyberGlowIndicator} from './lib/indicator.js';
 import {
+    compressAudioEnvelope,
     createVisualBeatState,
     denseMixAttenuation,
     updateBandKick,
@@ -58,6 +57,8 @@ const NEON_GLITCH_MEAN_INTERVAL = 3.5;
 const NEON_GLITCH_MAX_DURATION = 0.2;
 const NEON_GLITCH_MAX_STRENGTH = 0.85;
 const NEON_GLITCH_PULSE_BRIGHTNESS = 1.0;
+const NEON_HUM_MIN = 1.0;
+const NEON_HUM_MAX = 1.0;
 const NEON_AUDIO_SCALE_MAX = 0.16;
 const NEON_AUDIO_ATTACK_SMOOTH = 0.92;
 const NEON_AUDIO_DECAY_SMOOTH = 0.68;
@@ -75,6 +76,7 @@ const NEON_AUDIO_RAIN_ALPHA_BASS_MAX = 0.3;
 const NEON_AUDIO_DUST_BRIGHTNESS_TREBLE_MAX = 0.36;
 const NEON_AUDIO_BEAT_GLITCH_THRESHOLD = 0.52;
 const NEON_AUDIO_BASS_GATE = 0.06;
+const NEON_AUDIO_HUM_BLEND = 0.1;
 const HEAVY_STARTUP_DELAY_MS = 2000;
 
 const NeonShapeEffect = {
@@ -119,6 +121,11 @@ const NeonShapeEffect = {
             episodeDur: 0,
             flickerPhase: 0,
             nextFlickerIn: expRand(NEON_GLITCH_MEAN_INTERVAL),
+            humPhase: rand(0, Math.PI * 2),
+            humSpeed: rand(0.50, 0.85),
+            humWobble: rand(0, Math.PI * 2),
+            humWobbleSpeed: rand(0.14, 0.25),
+            intensityLevel: 1.0,
             audioScale: 1.0,
             beatColorBoost: 0,
             audioGlowBoost: 1.0,
@@ -254,7 +261,8 @@ const NeonShapeEffect = {
     },
     _getNeonType() {
         if (!this._settings) return 0;
-        return clamp(this._settings.get_int('neon-shape'), 0, 7);
+        const shape = this._settings.get_int('neon-shape');
+        return clamp(shape === 3 ? 2 : shape, 0, 2);
     },
     _buildGlowPasses(gsz, glowAlpha) {
         const passes = getGlowWidthPasses(gsz, this._glowPassCount);
@@ -351,25 +359,6 @@ const NeonShapeEffect = {
         }
         ctx.closePath();
     },
-    _traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius) {
-        const r = Math.min(cornerRadius, halfW, halfH);
-        const left = cx - halfW;
-        const right = cx + halfW;
-        const top = cy - halfH;
-        const bottom = cy + halfH;
-
-        ctx.newPath();
-        ctx.moveTo(left + r, top);
-        ctx.lineTo(right - r, top);
-        ctx.arc(right - r, top + r, r, -Math.PI / 2, 0);
-        ctx.lineTo(right, bottom - r);
-        ctx.arc(right - r, bottom - r, r, 0, Math.PI / 2);
-        ctx.lineTo(left + r, bottom);
-        ctx.arc(left + r, bottom - r, r, Math.PI / 2, Math.PI);
-        ctx.lineTo(left, top + r);
-        ctx.arc(left + r, top + r, r, Math.PI, Math.PI * 1.5);
-        ctx.closePath();
-    },
     _shapeCornerRadius(size) {
         return size * 0.055;
     },
@@ -394,32 +383,8 @@ const NeonShapeEffect = {
         const baseCorner = this._shapeCornerRadius(s.size);
         const cornerRadius = this._cornerRadiusForOffset(baseCorner, offset);
 
-        if (type === 4 || type === 5 || type === 6) {
-            const wide = radius * (Math.sqrt(3) / 2);
-            let halfW;
-            let halfH;
-            if (type === 4) {
-                halfW = radius;
-                halfH = radius * 0.5;
-            } else if (type === 5) {
-                halfW = wide;
-                halfH = wide;
-            } else {
-                halfW = radius * 0.5;
-                halfH = radius;
-            }
-            this._traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius);
-            return;
-        }
-
-        if (type === 7) {
-            this._traceRoundedPolygonPath(ctx, cx, cy, radius, 4, -Math.PI / 2, cornerRadius);
-            return;
-        }
-
-        const sides = type === 3 ? 6 : 3;
         const rot = type === 1 ? Math.PI / 2 : -Math.PI / 2;
-        this._traceRoundedPolygonPath(ctx, cx, cy, radius, sides, rot, cornerRadius);
+        this._traceRoundedPolygonPath(ctx, cx, cy, radius, 3, rot, cornerRadius);
     },
     _getNeonColor() {
         if (!this._settings)
@@ -510,6 +475,16 @@ const NeonShapeEffect = {
             return 1.0 / rand(48, 78);
         return 1.0 / rand(22, 42);
     },
+    _updateIntensityHum(dt) {
+        const s = this.shape;
+        s.humPhase += s.humSpeed * dt;
+        s.humWobble += s.humWobbleSpeed * dt;
+        const primary = 0.5 + 0.5 * Math.sin(s.humPhase);
+        const secondary = 0.5 + 0.5 * Math.sin(s.humPhase * 0.41 + s.humWobble);
+        const blend = primary * 0.62 + secondary * 0.38;
+        const shaped = Math.pow(blend, 0.88);
+        return lerp(NEON_HUM_MIN, NEON_HUM_MAX, shaped);
+    },
     _audioReactSmooth(current, target) {
         return target > current ? NEON_AUDIO_ATTACK_SMOOTH : NEON_AUDIO_DECAY_SMOOTH;
     },
@@ -529,7 +504,15 @@ const NeonShapeEffect = {
     _gatedBassLevel(bass = this._bassLevel) {
         return clamp((bass - NEON_AUDIO_BASS_GATE) / (1 - NEON_AUDIO_BASS_GATE), 0, 1);
     },
-    _updateAudioReact(dt) {
+    _audioEnvelope(bass, mid, treble, beat) {
+        const gatedBass = this._gatedBassLevel(bass);
+        return clamp(
+            gatedBass * 0.52 + mid * 0.28 + treble * 0.1 + beat * 0.62,
+            0,
+            1
+        );
+    },
+    _updateAudioReact(humIntensity, dt) {
         const s = this.shape;
         if (!this._musicReactive) {
             s.audioScale = lerp(s.audioScale ?? 1.0, 1.0, 0.12);
@@ -558,6 +541,10 @@ const NeonShapeEffect = {
         const density = denseMixAttenuation(gatedBass, mid, treble);
         this._densityFactor = density;
 
+        const envelope = compressAudioEnvelope(
+            this._audioEnvelope(bass, mid, treble, visualBeat)
+        );
+
         const targetScale = 1.0
             + bassKick * NEON_AUDIO_SCALE_MAX * density
             + visualBeat * NEON_AUDIO_BEAT_SCALE_MAX;
@@ -568,6 +555,15 @@ const NeonShapeEffect = {
         if (visualBeat < 0.1 && currentScale > 1.01)
             scaleSmooth = Math.min(scaleSmooth, NEON_AUDIO_SCALE_DECAY_SMOOTH);
         s.audioScale = lerp(currentScale, targetScale, scaleSmooth);
+
+        const audioIntensity = lerp(NEON_HUM_MIN, NEON_HUM_MAX, envelope);
+        const targetIntensity = lerp(audioIntensity, humIntensity, NEON_AUDIO_HUM_BLEND);
+        const currentIntensity = s.intensityLevel ?? humIntensity;
+        const intensitySmooth = visualBeat > (s._lastVisualBeat ?? 0)
+            ? NEON_AUDIO_BEAT_ATTACK_SMOOTH
+            : this._audioReactSmooth(currentIntensity, targetIntensity);
+        s.intensityLevel = lerp(currentIntensity, targetIntensity, intensitySmooth);
+        s._lastVisualBeat = visualBeat;
 
         const targetBeatColor = visualBeat * NEON_AUDIO_BEAT_COLOR_MAX;
         s.beatColorBoost = lerp(
@@ -591,15 +587,15 @@ const NeonShapeEffect = {
             this._triggerBeatGlitch();
     },
     update(dt) {
-        const monitor = Main.layoutManager.primaryMonitor;
-        if (!monitor)
-            return;
-        const w = monitor.width;
-        const h = monitor.height;
+        const w = Main.layoutManager.primaryMonitor.width;
+        const h = Main.layoutManager.primaryMonitor.height;
         this._updateDust(dt, w, h);
         this._updateRain(dt, w, h);
+        const humIntensity = this._updateIntensityHum(dt);
         if (this._musicReactive)
-            this._updateAudioReact(dt);
+            this._updateAudioReact(humIntensity, dt);
+        else
+            this.shape.intensityLevel = humIntensity;
 
         const s = this.shape;
         const meanInterval = NEON_GLITCH_MEAN_INTERVAL;
@@ -627,7 +623,7 @@ const NeonShapeEffect = {
 
         s.flickerLevel = 1.0;
         s.nextFlickerIn -= dt;
-        if (s.nextFlickerIn <= 0) {
+        if (s.nextFlickerIn <= 0 && !this._musicReactive) {
             s.inFlickerEpisode = true;
             s.episodeT = 0;
             s.flickerPhase = 0;
@@ -647,6 +643,8 @@ const NeonShapeEffect = {
         const level = clamp(s.flickerLevel ?? 1.0, 0.0, 1.0);
         const flickerMix = clamp(NEON_GLITCH_PULSE_BRIGHTNESS, 0.0, 2.0);
         const flickerMult = clamp(1.0 - (1.0 - level) * flickerMix, 0.0, 1.0);
+        const intensityMin = NEON_HUM_MIN;
+        const intensityMult = clamp(s.intensityLevel ?? 1.0, intensityMin, NEON_HUM_MAX);
         const peakAlpha = clamp(baseAlpha * NEON_BRIGHTNESS * flickerMult, 0.0, 1.0);
         const beatColorBoost = clamp(s.beatColorBoost ?? 0, 0.0, NEON_AUDIO_BEAT_COLOR_MAX);
         const bass = this._musicReactive ? this._bassLevel : 0;
@@ -654,7 +652,7 @@ const NeonShapeEffect = {
         const treble = this._musicReactive ? this._trebleLevel : 0;
         const beat = this._musicReactive ? this._visualBeatPulse : 0;
         const alpha = clamp(
-            peakAlpha * (1.0 + beatColorBoost + gatedBass * 0.08 + beat * 0.18),
+            peakAlpha * intensityMult * (1.0 + beatColorBoost + gatedBass * 0.08 + beat * 0.18),
             0.0,
             1.0
         );
@@ -699,7 +697,7 @@ const NeonShapeEffect = {
 
         this._rebuildPathCacheIfNeeded(w, h, type);
         const glowPasses = this._buildGlowPasses(NEON_GLOW_SIZE, glowAlpha);
-        const prevOp = ctx.getOperator?.() ?? Cairo.Operator.OVER;
+        const prevOp = ctx.getOperator() ?? Cairo.Operator.OVER;
         ctx.setOperator(Cairo.Operator.ADD);
         for (const p of glowPasses) {
             const half = p.w / 2;
@@ -793,19 +791,15 @@ export default class CyberGlowExtension extends Extension {
         this._enableRetries = 0;
         this._deferredStartupId = null;
         this._settings = null;
-        this._idleInhibitor = null;
-        this._indicator = null;
     }
 
     enable() {
-        if (this._canvas || this._enableRetrySource || this._settings)
+        if (this._canvas)
             return;
 
-        this._settings = this.getSettings();
-        this._indicator = new CyberGlowIndicator(this, this._settings);
-        this._idleInhibitor = new IdleInhibitor();
-
         this._enableRetries = 0;
+        if (this._enableRetrySource)
+            GLib.source_remove(this._enableRetrySource);
         this._enableRetrySource = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             return this._enableWhenReady();
         });
@@ -821,7 +815,12 @@ export default class CyberGlowExtension extends Extension {
         }
 
         this._enableRetrySource = null;
-        this._enableInternal(backgroundGroup);
+        try {
+            this._enableInternal(backgroundGroup);
+        } catch (err) {
+            console.error('[CyberGlow] failed to enable extension:', err);
+            this.disable();
+        }
         return GLib.SOURCE_REMOVE;
     }
 
@@ -829,15 +828,13 @@ export default class CyberGlowExtension extends Extension {
         const monitor = Main.layoutManager.primaryMonitor;
         this._width = monitor.width;
         this._height = monitor.height;
+        this._settings = this.getSettings();
 
         this._onRepaintHandler = this._onRepaint.bind(this);
         this._canvas = new St.DrawingArea({
             width: this._width,
             height: this._height,
-            reactive: false,
-            can_focus: false,
         });
-        this._canvas.set_style('background-color: transparent;');
         this._canvas.connectObject(
             'repaint',
             this._onRepaintHandler,
@@ -853,15 +850,9 @@ export default class CyberGlowExtension extends Extension {
         this._settings.connectObject(
             'changed',
             (_settings, key) => {
-                if (key === 'neon-enabled') {
-                    this._syncNeonEnabled();
-                    return;
-                }
-
                 if (key === 'music-reactive') {
                     this._initEffect();
                     this._syncAudioVisualizer();
-                    this._syncIdleInhibit();
                     return;
                 }
 
@@ -870,17 +861,13 @@ export default class CyberGlowExtension extends Extension {
                     return;
                 }
 
-                if (key === 'keep-awake') {
-                    this._syncIdleInhibit();
-                    return;
-                }
-
                 this._initEffect();
             },
             this,
         );
 
-        this._syncNeonEnabled();
+        this._lastFrameTime = GLib.get_monotonic_time();
+        this._rescheduleFrameTimer(this._desiredFrameInterval(false));
 
         Main.layoutManager.connectObject(
             'monitors-changed',
@@ -901,7 +888,11 @@ export default class CyberGlowExtension extends Extension {
                 this._deferredStartupId = null;
                 if (!this._canvas)
                     return GLib.SOURCE_REMOVE;
-                this._startHeavySubsystems();
+                try {
+                    this._startHeavySubsystems();
+                } catch (err) {
+                    console.error('[CyberGlow] deferred startup failed:', err);
+                }
                 return GLib.SOURCE_REMOVE;
             }
         );
@@ -924,19 +915,6 @@ export default class CyberGlowExtension extends Extension {
 
         this._syncAudioVisualizer();
         this._syncUnderglow();
-        this._syncIdleInhibit();
-    }
-
-    _syncIdleInhibit() {
-        if (!this._settings || !this._idleInhibitor)
-            return;
-
-        const want = this._settings.get_boolean('keep-awake')
-            && this._settings.get_boolean('neon-enabled')
-            && this._settings.get_boolean('music-reactive')
-            && this._audioVisualizer
-            && !this._audioVisualizer.isSilent;
-        this._idleInhibitor.setActive(want);
     }
 
     _syncUnderglow() {
@@ -946,8 +924,13 @@ export default class CyberGlowExtension extends Extension {
             if (this._underglow)
                 return;
 
-            this._underglow = new UnderglowManager(this._settings);
-            this._underglow.enable();
+            try {
+                this._underglow = new UnderglowManager(this._settings);
+                this._underglow.enable();
+            } catch (err) {
+                console.error('[CyberGlow] failed to enable underglow:', err);
+                this._underglow = null;
+            }
             return;
         }
 
@@ -999,33 +982,8 @@ export default class CyberGlowExtension extends Extension {
             this._audioVisualizer = null;
         }
 
-        this._indicator?.destroy();
-        this._indicator = null;
-
-        this._idleInhibitor?.destroy();
-        this._idleInhibitor = null;
         this._lastFrameTime = 0;
         this._settings = null;
-    }
-
-    _syncNeonEnabled() {
-        if (!this._settings || !this._canvas)
-            return;
-
-        const enabled = this._settings.get_boolean('neon-enabled');
-        this._canvas.visible = enabled;
-
-        if (enabled) {
-            this._lastFrameTime = GLib.get_monotonic_time();
-            this._rescheduleFrameTimer(this._desiredFrameInterval(false));
-            this._canvas.queue_repaint();
-        } else if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = null;
-        }
-
-        this._syncAudioVisualizer();
-        this._syncIdleInhibit();
     }
 
     _initEffect() {
@@ -1035,15 +993,19 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _syncAudioVisualizer() {
-        const enabled = this._settings.get_boolean('neon-enabled')
-            && this._settings.get_boolean('music-reactive');
+        const enabled = this._settings.get_boolean('music-reactive');
         NeonShapeEffect.setMusicReactive(enabled);
-        this._underglow?.setAudioIntensity?.(1.0, 0);
+        this._underglow?.setAudioIntensity(1.0, 0);
 
         if (enabled) {
             if (!this._audioVisualizer) {
-                this._audioVisualizer = new AudioVisualizer();
-                this._audioVisualizer.enable();
+                try {
+                    this._audioVisualizer = new AudioVisualizer();
+                    this._audioVisualizer.enable();
+                } catch (err) {
+                    console.error('[CyberGlow] failed to enable audio visualizer:', err);
+                    this._audioVisualizer = null;
+                }
             }
         } else if (this._audioVisualizer) {
             this._audioVisualizer.disable();
@@ -1057,9 +1019,6 @@ export default class CyberGlowExtension extends Extension {
     _desiredFrameInterval(inFlicker) {
         const cfg = PERF_TIERS[this._perfTier] ?? PERF_TIERS.normal;
         let interval = inFlicker ? cfg.frameMsFlicker : cfg.frameMsCalm;
-
-        if (!this._settings?.get_boolean('neon-enabled'))
-            return interval;
 
         if (!this._settings.get_boolean('music-reactive'))
             return interval;
@@ -1094,14 +1053,8 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _rescheduleFrameTimer(intervalMs) {
-        if (this._timeoutId) {
+        if (this._timeoutId)
             GLib.source_remove(this._timeoutId);
-            this._timeoutId = null;
-        }
-
-        if (!this._settings?.get_boolean('neon-enabled'))
-            return;
-
         this._frameIntervalMs = intervalMs;
         this._timeoutId = GLib.timeout_add(GLib.PRIORITY_LOW, intervalMs, () => {
             this._onFrame();
@@ -1123,9 +1076,6 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _onFrame() {
-        if (!this._settings?.get_boolean('neon-enabled'))
-            return;
-
         const now = GLib.get_monotonic_time();
         const dt = Math.min((now - this._lastFrameTime) / 1000000, 0.1);
         this._lastFrameTime = now;
@@ -1144,7 +1094,7 @@ export default class CyberGlowExtension extends Extension {
         NeonShapeEffect.update(dt);
         if (this._audioVisualizer && musicReactive) {
             const visualBeat = NeonShapeEffect._visualBeatPulse;
-            this._underglow?.setAudioIntensity?.(
+            this._underglow?.setAudioIntensity(
                 1.0 + this._audioVisualizer.bassLevel * 0.5 + visualBeat * 0.22,
                 visualBeat
             );
@@ -1153,7 +1103,6 @@ export default class CyberGlowExtension extends Extension {
         const desiredInterval = this._desiredFrameInterval(inFlicker);
         if (desiredInterval !== this._frameIntervalMs || wasFlickering !== inFlicker)
             this._rescheduleFrameTimer(desiredInterval);
-        this._syncIdleInhibit();
         this._canvas.queue_repaint();
     }
 
@@ -1166,8 +1115,7 @@ export default class CyberGlowExtension extends Extension {
         ctx.paint();
         ctx.setOperator(Cairo.Operator.OVER);
 
-        if (this._settings?.get_boolean('neon-enabled'))
-            NeonShapeEffect.draw(ctx, width, height);
+        NeonShapeEffect.draw(ctx, width, height);
 
         ctx.$dispose();
         return Clutter.EVENT_STOP;

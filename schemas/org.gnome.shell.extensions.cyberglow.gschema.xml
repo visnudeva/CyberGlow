@@ -2,15 +2,10 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.cyberglow"
           path="/org/gnome/shell/extensions/cyberglow/">
-    <key name="neon-enabled" type="b">
-      <default>true</default>
-      <summary>Neon enabled</summary>
-      <description>Show the neon shape overlay on the desktop background</description>
-    </key>
     <key name="neon-shape" type="i">
       <default>0</default>
       <summary>Neon shape</summary>
-      <description>0: up-triangle, 1: down-triangle, 2: circle, 3: hexagon, 4: horizontal rectangle, 5: square, 6: vertical rectangle, 7: diamond</description>
+      <description>0: up-triangle, 1: down-triangle, 2: circle</description>
     </key>
     <key name="neon-color" type="s">
       <default>'#00ffcc'</default>
@@ -31,11 +26,6 @@
       <default>false</default>
       <summary>Reverse rain</summary>
       <description>Make the neon rain fall upward instead of downward</description>
-    </key>
-    <key name="keep-awake" type="b">
-      <default>false</default>
-      <summary>Keep awake</summary>
-      <description>Prevent the screen from blanking while music visualization is active</description>
     </key>
   </schema>
 </schemalist>

@@ -29,14 +29,9 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
             title: 'Shape',
             subtitle: 'Pick one of the shapes (no morphing)',
             model: Gtk.StringList.new([
-                'Up triangle',
-                'Down triangle',
+                'up-triangle',
+                'down-triangle',
                 'Circle',
-                'Hexagon',
-                'Horizontal rectangle',
-                'Square',
-                'Vertical rectangle',
-                'Diamond',
             ]),
             selected: settings.get_int('neon-shape'),
         });
@@ -113,21 +108,6 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
                 musicReactiveRow.set_active(active);
         });
         neonGroup.add(musicReactiveRow);
-
-        const keepAwakeRow = new Adw.SwitchRow({
-            title: 'Keep awake',
-            subtitle: 'Prevent screen blanking while music visualization is active',
-            active: settings.get_boolean('keep-awake'),
-        });
-        bind(keepAwakeRow, 'notify::active', () => {
-            settings.set_boolean('keep-awake', keepAwakeRow.get_active());
-        });
-        bind(settings, 'changed::keep-awake', () => {
-            const active = settings.get_boolean('keep-awake');
-            if (keepAwakeRow.get_active() !== active)
-                keepAwakeRow.set_active(active);
-        });
-        neonGroup.add(keepAwakeRow);
 
         const reverseRainRow = new Adw.SwitchRow({
             title: 'Reverse rain',
