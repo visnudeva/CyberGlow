@@ -38,6 +38,17 @@ function importLib(relPath) {
     return import(pathToFileURL(join(root, relPath)).href);
 }
 
+const EXPECTED_SHAPES = [
+    'up-triangle',
+    'down-triangle',
+    'Circle',
+    'Hexagon',
+    'Horizontal rectangle',
+    'Square',
+    'Vertical rectangle',
+    'Diamond',
+];
+
 suite('lib/utils.js');
 const {
     lerp, clamp, monitorDeviceNameFromSink, colorChannelsToRgb01,
@@ -264,14 +275,16 @@ test('contentOffset and clampedContentOffset', () => {
     });
     assert.deepEqual(contentOffset(win), [10, 20, -20, -40]);
     assert.equal(clampedContentOffset(win).length, 4);
+    assert.deepEqual(clampedContentOffset(null), [0, 0, 0, 0]);
     assert.equal(isUnderglowGeometrySane(win), true);
     assert.equal(isUnderglowGeometrySane(null), false);
 });
 
 suite('lib/gtk-shadow-cleanup.js');
+const gtkCleanup = await importLib('lib/gtk-shadow-cleanup.js');
 const {
     removeGtkShadowBlock, GTK_SHADOW_MARKER_BEGIN, GTK_SHADOW_MARKER_END,
-} = await importLib('lib/gtk-shadow-cleanup.js');
+} = gtkCleanup;
 
 test('removeGtkShadowBlock strips marked blocks and preserves other CSS', () => {
     const css = `/* user css */
@@ -287,16 +300,53 @@ ${GTK_SHADOW_MARKER_END}
     assert.equal(removeGtkShadowBlock(null), '');
 });
 
-suite('EGO review compliance');
-const metadata = JSON.parse(readFileSync(join(root, 'metadata.json'), 'utf8'));
+test('gtk-shadow-cleanup only exports cleanup helpers', () => {
+    assert.equal('hasGtkShadowBlock' in gtkCleanup, false);
+    assert.equal('buildGtkUnderglowBlock' in gtkCleanup, false);
+    assert.equal(typeof gtkCleanup.removeGtkShadowBlock, 'function');
+});
+
+suite('neon shapes');
 const extensionJs = readFileSync(join(root, 'extension.js'), 'utf8');
 const prefsJs = readFileSync(join(root, 'prefs.js'), 'utf8');
+const schemaXml = readFileSync(
+    join(root, 'schemas/org.gnome.shell.extensions.cyberglow.gschema.xml'),
+    'utf8'
+);
+
+test('prefs lists all 8 shape options', () => {
+    for (const name of EXPECTED_SHAPES)
+        assert.ok(prefsJs.includes(`'${name}'`), `missing shape: ${name}`);
+    assert.match(prefsJs, /const shapeCount = shapeNames\.length/);
+});
+
+test('extension clamps neon-shape to 0..7', () => {
+    assert.match(extensionJs, /clamp\(this\._settings\.get_int\('neon-shape'\),\s*0,\s*7\)/);
+    assert.equal(/shape === 3 \? 2/.test(extensionJs), false);
+});
+
+test('schema documents all 8 shapes', () => {
+    assert.ok(schemaXml.includes('hexagon'));
+    assert.ok(schemaXml.includes('diamond'));
+    assert.ok(schemaXml.includes('horizontal rectangle'));
+    assert.ok(schemaXml.includes('vertical rectangle'));
+    assert.ok(schemaXml.includes('square'));
+});
+
+test('extension draws hexagon, rects, and diamond types', () => {
+    assert.ok(extensionJs.includes('_traceRoundedRectPath'));
+    assert.match(extensionJs, /type === 4 \|\| type === 5 \|\| type === 6/);
+    assert.match(extensionJs, /type === 7/);
+    assert.match(extensionJs, /type === 3 \? 6 : 3/);
+});
+
+suite('EGO review compliance');
+const metadata = JSON.parse(readFileSync(join(root, 'metadata.json'), 'utf8'));
 const audioPactl = readFileSync(join(root, 'lib/audio-pactl.js'), 'utf8');
 const audioViz = readFileSync(join(root, 'lib/audio-visualizer.js'), 'utf8');
 const underglow = readFileSync(join(root, 'lib/underglow.js'), 'utf8');
-const indicator = readFileSync(join(root, 'lib/indicator.js'), 'utf8');
-const idleInhibit = readFileSync(join(root, 'lib/idle-inhibit.js'), 'utf8');
-const coreSources = [extensionJs, prefsJs, audioPactl, audioViz, underglow, indicator, idleInhibit];
+const underglowStyle = readFileSync(join(root, 'lib/underglow-style.js'), 'utf8');
+const coreSources = [extensionJs, prefsJs, audioPactl, audioViz, underglow, underglowStyle];
 
 test('metadata has no preferences key', () => {
     assert.equal('preferences' in metadata, false);
@@ -317,14 +367,14 @@ test('audio-visualizer checks Gst.is_initialized before init', () => {
 });
 
 test('no this._enabled flag pattern in core modules', () => {
-    for (const src of [extensionJs, underglow, audioViz, idleInhibit, indicator])
+    for (const src of [extensionJs, underglow, audioViz])
         assert.equal(/this\._enabled\b/.test(src), false);
 });
 
 test('extension/underglow/audio use INSTANCE.connectObject / disconnectObject', () => {
-    for (const src of [extensionJs, underglow, audioViz, indicator]) {
+    for (const src of [extensionJs, underglow, audioViz]) {
         assert.ok(src.includes('.connectObject('));
-        assert.ok(src.includes('.disconnectObject(this)') || src.includes('.disconnectObject(item)'));
+        assert.ok(src.includes('.disconnectObject(this)'));
         assert.equal(/this\.connectObject\(/.test(src), false);
         assert.equal(/this\.disconnectObject\(\)/.test(src), false);
     }
@@ -340,7 +390,7 @@ test('frame timeout cleared before reschedule and on disable', () => {
     assert.ok(extensionJs.includes('_rescheduleFrameTimer'));
     assert.match(
         extensionJs,
-        /_rescheduleFrameTimer\(intervalMs\)\s*\{[\s\S]*?if \(this\._timeoutId\)\s*\{[\s\S]*?GLib\.source_remove\(this\._timeoutId\)/
+        /_rescheduleFrameTimer\(intervalMs\)\s*\{[\s\S]*?if \(this\._timeoutId\)\s*GLib\.source_remove\(this\._timeoutId\)/
     );
     assert.match(
         extensionJs,
@@ -348,12 +398,21 @@ test('frame timeout cleared before reschedule and on disable', () => {
     );
 });
 
+test('pipeline retry timeout cleared before recreate', () => {
+    assert.match(
+        audioViz,
+        /_schedulePipelineRetry\(delayMs\)\s*\{[\s\S]*?this\._clearPipelineRetry\(\)/
+    );
+    assert.match(
+        audioViz,
+        /_clearPipelineRetry\(\)\s*\{[\s\S]*?GLib\.source_remove\(this\._pipelineRetryId\)/
+    );
+});
+
 test('single shared settings instance (one getSettings in extension)', () => {
     const calls = extensionJs.match(/this\.getSettings\(\)/g) ?? [];
     assert.equal(calls.length, 1);
-    assert.ok(extensionJs.includes('new CyberGlowIndicator(this, this._settings)'));
-    assert.ok(indicator.includes('_init(extension, settings)'));
-    assert.equal(indicator.includes('getSettings('), false);
+    assert.ok(extensionJs.includes('new UnderglowManager(this._settings)'));
 });
 
 test('underglow disable fully cleans up (no selective disable)', () => {
@@ -364,14 +423,40 @@ test('underglow disable fully cleans up (no selective disable)', () => {
     assert.equal(/if\s*\(\s*!this\._enabled\s*\)/.test(underglow), false);
 });
 
+test('only onDone/onReady use optional-call chaining', () => {
+    const banned = [
+        /\.is_finalized\?\./,
+        /\.get_title\?\./,
+        /\.get_frame_rect\?\./,
+        /\.get_constraints\?\./,
+        /\.get_default_sink\?\./,
+        /\.get_state\?\./,
+        /\.getOperator\?\./,
+        /\.setAudioIntensity\?\./,
+        /get_meta_window\?\.\(\)\s*\?\?/,
+    ];
+    for (const src of coreSources) {
+        for (const pattern of banned)
+            assert.equal(pattern.test(src), false, `banned pattern ${pattern}`);
+    }
+
+    const optionalCalls = [];
+    for (const src of coreSources) {
+        for (const match of src.matchAll(/(\w+)\?\.\(/g))
+            optionalCalls.push(match[1]);
+    }
+    for (const name of optionalCalls)
+        assert.ok(name === 'onDone' || name === 'onReady', `unexpected optional call: ${name}?.()`);
+
+    assert.ok(underglow.includes('windowActor.get_meta_window()'));
+    assert.ok(underglowStyle.includes('win.get_frame_rect()'));
+    assert.ok(audioViz.includes('this._mixer.get_default_sink()'));
+    assert.ok(extensionJs.includes('ctx.getOperator()'));
+});
+
 test('no debug console.log in shipped modules', () => {
     for (const src of coreSources)
         assert.equal(/console\.(log|debug|info)\(/.test(src), false);
-});
-
-test('idle inhibit uses SessionManager D-Bus, not spawn', () => {
-    assert.ok(idleInhibit.includes('org.gnome.SessionManager'));
-    assert.equal(/GLib\.spawn|spawn_command|spawn_async/.test(idleInhibit), false);
 });
 
 test('all JS modules parse with node --check', () => {

@@ -261,8 +261,7 @@ const NeonShapeEffect = {
     },
     _getNeonType() {
         if (!this._settings) return 0;
-        const shape = this._settings.get_int('neon-shape');
-        return clamp(shape === 3 ? 2 : shape, 0, 2);
+        return clamp(this._settings.get_int('neon-shape'), 0, 7);
     },
     _buildGlowPasses(gsz, glowAlpha) {
         const passes = getGlowWidthPasses(gsz, this._glowPassCount);
@@ -359,6 +358,25 @@ const NeonShapeEffect = {
         }
         ctx.closePath();
     },
+    _traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius) {
+        const r = Math.min(cornerRadius, halfW, halfH);
+        const left = cx - halfW;
+        const right = cx + halfW;
+        const top = cy - halfH;
+        const bottom = cy + halfH;
+
+        ctx.newPath();
+        ctx.moveTo(left + r, top);
+        ctx.lineTo(right - r, top);
+        ctx.arc(right - r, top + r, r, -Math.PI / 2, 0);
+        ctx.lineTo(right, bottom - r);
+        ctx.arc(right - r, bottom - r, r, 0, Math.PI / 2);
+        ctx.lineTo(left + r, bottom);
+        ctx.arc(left + r, bottom - r, r, Math.PI / 2, Math.PI);
+        ctx.lineTo(left, top + r);
+        ctx.arc(left + r, top + r, r, Math.PI, Math.PI * 1.5);
+        ctx.closePath();
+    },
     _shapeCornerRadius(size) {
         return size * 0.055;
     },
@@ -383,8 +401,32 @@ const NeonShapeEffect = {
         const baseCorner = this._shapeCornerRadius(s.size);
         const cornerRadius = this._cornerRadiusForOffset(baseCorner, offset);
 
+        if (type === 4 || type === 5 || type === 6) {
+            const wide = radius * (Math.sqrt(3) / 2);
+            let halfW;
+            let halfH;
+            if (type === 4) {
+                halfW = radius;
+                halfH = radius * 0.5;
+            } else if (type === 5) {
+                halfW = wide;
+                halfH = wide;
+            } else {
+                halfW = radius * 0.5;
+                halfH = radius;
+            }
+            this._traceRoundedRectPath(ctx, cx, cy, halfW, halfH, cornerRadius);
+            return;
+        }
+
+        if (type === 7) {
+            this._traceRoundedPolygonPath(ctx, cx, cy, radius, 4, -Math.PI / 2, cornerRadius);
+            return;
+        }
+
+        const sides = type === 3 ? 6 : 3;
         const rot = type === 1 ? Math.PI / 2 : -Math.PI / 2;
-        this._traceRoundedPolygonPath(ctx, cx, cy, radius, 3, rot, cornerRadius);
+        this._traceRoundedPolygonPath(ctx, cx, cy, radius, sides, rot, cornerRadius);
     },
     _getNeonColor() {
         if (!this._settings)
@@ -697,7 +739,7 @@ const NeonShapeEffect = {
 
         this._rebuildPathCacheIfNeeded(w, h, type);
         const glowPasses = this._buildGlowPasses(NEON_GLOW_SIZE, glowAlpha);
-        const prevOp = ctx.getOperator() ?? Cairo.Operator.OVER;
+        const prevOp = ctx.getOperator();
         ctx.setOperator(Cairo.Operator.ADD);
         for (const p of glowPasses) {
             const half = p.w / 2;
@@ -769,7 +811,8 @@ function createPowerProfilesProxy() {
 function readPowerSaverActive(proxy) {
     if (!proxy)
         return false;
-    const profile = proxy.get_cached_property('ActiveProfile')?.unpack();
+    const prop = proxy.get_cached_property('ActiveProfile');
+    const profile = prop ? prop.unpack() : null;
     return profile === 'power-saver';
 }
 
@@ -806,7 +849,7 @@ export default class CyberGlowExtension extends Extension {
     }
 
     _enableWhenReady() {
-        const backgroundGroup = Main.layoutManager?._backgroundGroup;
+        const backgroundGroup = Main.layoutManager && Main.layoutManager._backgroundGroup;
         if (!backgroundGroup) {
             this._enableRetries += 1;
             if (this._enableRetries > 120)
@@ -842,10 +885,10 @@ export default class CyberGlowExtension extends Extension {
         );
 
         this._canvas.set_position(monitor.x, monitor.y);
-        backgroundGroup.add_child(this._canvas);
 
         this._initEffect();
         this._setPerfTier('normal');
+        backgroundGroup.add_child(this._canvas);
 
         this._settings.connectObject(
             'changed',
@@ -858,6 +901,13 @@ export default class CyberGlowExtension extends Extension {
 
                 if (key === 'underglow') {
                     this._syncUnderglow();
+                    return;
+                }
+
+                if (key === 'neon-shape') {
+                    NeonShapeEffect._invalidatePathCache();
+                    if (this._canvas)
+                        this._canvas.queue_repaint();
                     return;
                 }
 
@@ -953,7 +1003,8 @@ export default class CyberGlowExtension extends Extension {
         }
 
         Main.layoutManager.disconnectObject(this);
-        this._settings?.disconnectObject(this);
+        if (this._settings)
+            this._settings.disconnectObject(this);
 
         if (this._powerProfilesProxy) {
             this._powerProfilesProxy.disconnectObject(this);
@@ -995,7 +1046,8 @@ export default class CyberGlowExtension extends Extension {
     _syncAudioVisualizer() {
         const enabled = this._settings.get_boolean('music-reactive');
         NeonShapeEffect.setMusicReactive(enabled);
-        this._underglow?.setAudioIntensity(1.0, 0);
+        if (this._underglow)
+            this._underglow.setAudioIntensity(1.0, 0);
 
         if (enabled) {
             if (!this._audioVisualizer) {
@@ -1012,7 +1064,8 @@ export default class CyberGlowExtension extends Extension {
             this._audioVisualizer = null;
         }
 
-        const inFlicker = NeonShapeEffect.shape?.inFlickerEpisode ?? false;
+        const shape = NeonShapeEffect.shape;
+        const inFlicker = shape ? shape.inFlickerEpisode : false;
         this._rescheduleFrameTimer(this._desiredFrameInterval(inFlicker));
     }
 
@@ -1048,7 +1101,8 @@ export default class CyberGlowExtension extends Extension {
             return;
         this._perfTier = tier;
         NeonShapeEffect.setPerfTier(tier);
-        const inFlicker = NeonShapeEffect.shape?.inFlickerEpisode ?? false;
+        const shape = NeonShapeEffect.shape;
+        const inFlicker = shape ? shape.inFlickerEpisode : false;
         this._rescheduleFrameTimer(this._desiredFrameInterval(inFlicker));
     }
 
@@ -1080,7 +1134,8 @@ export default class CyberGlowExtension extends Extension {
         const dt = Math.min((now - this._lastFrameTime) / 1000000, 0.1);
         this._lastFrameTime = now;
 
-        const wasFlickering = NeonShapeEffect.shape?.inFlickerEpisode ?? false;
+        const shapeBefore = NeonShapeEffect.shape;
+        const wasFlickering = shapeBefore ? shapeBefore.inFlickerEpisode : false;
         const musicReactive = this._settings.get_boolean('music-reactive');
         if (this._audioVisualizer && musicReactive) {
             NeonShapeEffect.setAudioLevels({
@@ -1094,12 +1149,15 @@ export default class CyberGlowExtension extends Extension {
         NeonShapeEffect.update(dt);
         if (this._audioVisualizer && musicReactive) {
             const visualBeat = NeonShapeEffect._visualBeatPulse;
-            this._underglow?.setAudioIntensity(
-                1.0 + this._audioVisualizer.bassLevel * 0.5 + visualBeat * 0.22,
-                visualBeat
-            );
+            if (this._underglow) {
+                this._underglow.setAudioIntensity(
+                    1.0 + this._audioVisualizer.bassLevel * 0.5 + visualBeat * 0.22,
+                    visualBeat
+                );
+            }
         }
-        const inFlicker = NeonShapeEffect.shape?.inFlickerEpisode ?? false;
+        const shapeAfter = NeonShapeEffect.shape;
+        const inFlicker = shapeAfter ? shapeAfter.inFlickerEpisode : false;
         const desiredInterval = this._desiredFrameInterval(inFlicker);
         if (desiredInterval !== this._frameIntervalMs || wasFlickering !== inFlicker)
             this._rescheduleFrameTimer(desiredInterval);

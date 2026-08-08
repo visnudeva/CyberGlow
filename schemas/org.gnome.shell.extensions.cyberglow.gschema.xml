@@ -5,7 +5,7 @@
     <key name="neon-shape" type="i">
       <default>0</default>
       <summary>Neon shape</summary>
-      <description>0: up-triangle, 1: down-triangle, 2: circle</description>
+      <description>0: up-triangle, 1: down-triangle, 2: circle, 3: hexagon, 4: horizontal rectangle, 5: square, 6: vertical rectangle, 7: diamond</description>
     </key>
     <key name="neon-color" type="s">
       <default>'#00ffcc'</default>

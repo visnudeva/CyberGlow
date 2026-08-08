@@ -25,21 +25,38 @@ export default class CyberGlowPreferences extends ExtensionPreferences {
         });
         page.add(neonGroup);
 
+        const shapeNames = [
+            'up-triangle',
+            'down-triangle',
+            'Circle',
+            'Hexagon',
+            'Horizontal rectangle',
+            'Square',
+            'Vertical rectangle',
+            'Diamond',
+        ];
+        const shapeCount = shapeNames.length;
+        let shape = settings.get_int('neon-shape');
+        if (shape < 0 || shape >= shapeCount) {
+            shape = 0;
+            settings.set_int('neon-shape', shape);
+        }
         const shapeRow = new Adw.ComboRow({
             title: 'Shape',
             subtitle: 'Pick one of the shapes (no morphing)',
-            model: Gtk.StringList.new([
-                'up-triangle',
-                'down-triangle',
-                'Circle',
-            ]),
-            selected: settings.get_int('neon-shape'),
+            model: Gtk.StringList.new(shapeNames),
+            selected: shape,
         });
         bind(shapeRow, 'notify::selected', () => {
-            settings.set_int('neon-shape', shapeRow.get_selected());
+            const selected = shapeRow.get_selected();
+            if (selected < 0 || selected >= shapeCount)
+                return;
+            settings.set_int('neon-shape', selected);
         });
         bind(settings, 'changed::neon-shape', () => {
             const v = settings.get_int('neon-shape');
+            if (v < 0 || v >= shapeCount)
+                return;
             if (shapeRow.get_selected() !== v)
                 shapeRow.set_selected(v);
         });
